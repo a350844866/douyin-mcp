@@ -588,9 +588,13 @@ def extract_detail_metrics(
 
     metrics: dict[str, Any] = {field: None for field in DETAIL_METRIC_FIELDS}
     raw_by_field: dict[str, str] = {}
+    # 本地补丁(2026-07-22):白名单外的标签(图文帖的 划走率/平均观看图片数 等)
+    # 按中文原名保留进 raw_metrics 一并入库,而不是丢弃;不动 schema 与 quality 口径
+    extra_raw: dict[str, str] = {}
     for label, raw_value in raw.items():
         field = _DETAIL_ALIASES.get(str(label).strip())
         if not field:
+            extra_raw[str(label).strip()] = str(raw_value).strip()
             continue
         raw_by_field[field] = str(raw_value).strip()
         if field in {"five_second_completion_rate", "completion_rate"}:
@@ -634,7 +638,7 @@ def extract_detail_metrics(
         "source_url": url,
         "login_status": login_status,
         "identity_confirmed": identity_confirmed,
-        "raw_metrics": raw_by_field,
+        "raw_metrics": {**extra_raw, **raw_by_field},
         "metrics": metrics,
         "missing_reasons": missing,
         "quality": quality,
