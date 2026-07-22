@@ -211,6 +211,28 @@ _OPEN_TRAFFIC_TAB_SCRIPT = r"""
 }
 """
 
+_EXTRACT_TRAFFIC_SOURCES_SCRIPT = r"""
+() => {
+  const lines = (document.body.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+  const start = lines.findIndex(s => s === '流量来源');
+  if (start < 0) return {};
+  const out = {};
+  const isName = s => /^[一-龥]{2,6}$/.test(s) && !['导出', '展开更多', '暂无数据'].includes(s);
+  const isPct = s => /^\d+(\.\d+)?%$/.test(s);
+  const isDelta = s => /^[+-]\d+(\.\d+)?%$/.test(s);
+  for (let i = start + 1; i < Math.min(lines.length, start + 60); i++) {
+    const s = lines[i];
+    if (s === '搜索关键词' || s === '观众数据') break;
+    if (isName(s) && isPct(lines[i + 1] || '')) {
+      out['来源:' + s] = lines[i + 1];
+      if (isDelta(lines[i + 2] || '')) out['来源Δ7日:' + s] = lines[i + 2];
+      i += 1;
+    }
+  }
+  return out;
+}
+"""
+
 _EXTRACT_TEXT_METRICS_SCRIPT = r"""
 () => {
   const lines = (document.body.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
@@ -712,6 +734,15 @@ def _collect_detail_sections(
         raw.update(traffic)
         collected_sections.append("traffic")
     _merge_text_pass("traffic_text")
+    # 流量来源分布(推荐页/朋友页占比 + 对比7日):三列表格,单独解析后并入 raw
+    try:
+        sources = page.evaluate(_EXTRACT_TRAFFIC_SOURCES_SCRIPT)
+    except Exception:
+        sources = {}
+    if isinstance(sources, dict) and sources:
+        for label, value in sources.items():
+            raw.setdefault(str(label).strip(), value)
+        collected_sections.append("traffic_sources")
     return raw, collected_sections
 
 
