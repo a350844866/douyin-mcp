@@ -64,6 +64,9 @@ class BrowserSession:
         launch_options: dict[str, Any] = {
             "user_data_dir": str(self.settings.douyin_browser_profile_dir),
             "headless": self._headless,
+            # 降低自动化指纹:关掉 AutomationControlled blink 特性(navigator.webdriver 由
+            # 下方 init script 再抹一层),减少创作者中心行为验证的暴露面
+            "args": ["--disable-blink-features=AutomationControlled"],
         }
         if self.settings.douyin_browser_channel:
             launch_options["channel"] = self.settings.douyin_browser_channel
@@ -77,6 +80,11 @@ class BrowserSession:
             self._playwright = None
             self._playwright_manager = None
             raise
+        try:
+            self._context.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});")
+        except Exception:  # noqa: BLE001 — init script 失败不阻断,仅少一层伪装
+            pass
         return self._context
 
     def open_page(self, url: str, wait_until: str = "domcontentloaded") -> Any:
