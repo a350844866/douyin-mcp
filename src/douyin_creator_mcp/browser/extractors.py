@@ -211,6 +211,22 @@ _OPEN_TRAFFIC_TAB_SCRIPT = r"""
 }
 """
 
+_EXTRACT_TEXT_METRICS_SCRIPT = r"""
+() => {
+  const lines = (document.body.innerText || '').split('\n').map(s => s.trim()).filter(Boolean);
+  const isLabel = s => /^[一-龥A-Za-z0-9]{2,14}(率|量|数|占比)$/.test(s);
+  const isNum = s => /^-?[\d,]+(\.\d+)?$/.test(s);
+  const out = {};
+  for (let i = 0; i + 1 < lines.length; i++) {
+    if (!isLabel(lines[i]) || !isNum(lines[i + 1])) continue;
+    let value = lines[i + 1];
+    if (lines[i + 2] === '%') value += '%';
+    if (!(lines[i] in out)) out[lines[i]] = value;
+  }
+  return out;
+}
+"""
+
 DETAIL_METRIC_FIELDS = (
     "exposure_count",
     "play_count",
@@ -654,6 +670,20 @@ def _collect_detail_sections(
 ) -> tuple[dict[str, Any], list[str]]:
     raw: dict[str, Any] = {}
     collected_sections: list[str] = []
+
+    def _merge_text_pass(section: str) -> None:
+        # 本地补丁(2026-07-22):新版数据块(划走率/平均浏览图片数/文案完读率等)
+        # 不用 metric-label-* class,按 innerText「标签行+数值行(+%行)」配对兜底采集;
+        # class 采集结果优先(setdefault 不覆盖)
+        try:
+            text_metrics = page.evaluate(_EXTRACT_TEXT_METRICS_SCRIPT)
+        except Exception:
+            return
+        if isinstance(text_metrics, dict) and text_metrics:
+            for label, value in text_metrics.items():
+                raw.setdefault(str(label).strip(), value)
+            collected_sections.append(section)
+
     try:
         overview = page.evaluate(_EXTRACT_DETAIL_METRICS_SCRIPT)
     except Exception:
@@ -661,6 +691,7 @@ def _collect_detail_sections(
     if isinstance(overview, dict):
         raw.update(overview)
         collected_sections.append("overview")
+    _merge_text_pass("overview_text")
 
     if login_status != LOGGED_IN:
         return raw, collected_sections
@@ -672,7 +703,7 @@ def _collect_detail_sections(
         return raw, collected_sections
     wait_for_timeout = getattr(page, "wait_for_timeout", None)
     if callable(wait_for_timeout):
-        wait_for_timeout(800)
+        wait_for_timeout(1500)
     try:
         traffic = page.evaluate(_EXTRACT_DETAIL_METRICS_SCRIPT)
     except Exception:
@@ -680,6 +711,7 @@ def _collect_detail_sections(
     if isinstance(traffic, dict):
         raw.update(traffic)
         collected_sections.append("traffic")
+    _merge_text_pass("traffic_text")
     return raw, collected_sections
 
 
