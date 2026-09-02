@@ -111,7 +111,11 @@ class DefaultBrowserBackend:
             videos: list[dict[str, Any]] = []
             load_stats: dict[str, Any] = {}
             if initial["login_status"] == "logged_in":
-                videos, load_stats = collect_all_video_cards(page)
+                videos, load_stats = collect_all_video_cards(
+                    page,
+                    api_paging=self.settings.douyin_list_api_paging,
+                    api_max_pages=self.settings.douyin_list_api_max_pages,
+                )
             snapshot = extract_page_snapshot(page, videos, load_stats)
             return {"snapshot": snapshot, "videos": videos, "load_stats": load_stats}
         if isinstance(command, SyncVideoDetails):

@@ -18,6 +18,7 @@ from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
 
 from ..browser.extractors import (
+    WORK_LIST_CLASSIFICATION_SOURCE,
     DETAIL_METRIC_FIELDS,
     LOGGED_IN,
     LOGIN_REQUIRED,
@@ -305,34 +306,65 @@ class BrowserService:
                     }
                     structured_videos = []
                     if snapshot["login_status"] == LOGGED_IN:
-                        structured_videos, load_stats = collect_all_video_cards(page)
+                        structured_videos, load_stats = collect_all_video_cards(
+                            page,
+                            api_paging=self.settings.douyin_list_api_paging,
+                            api_max_pages=self.settings.douyin_list_api_max_pages,
+                        )
                         snapshot = extract_page_snapshot(
                             page,
                             structured_videos=structured_videos,
                             load_stats=load_stats,
                         )
                 if snapshot["login_status"] == LOGGED_IN:
-                    account_identity = self._verify_browser_account_identity(
-                        account_id,
-                        structured_videos,
-                        captured_at,
-                    )
+                    # Anchor the account identity on page cards only: work_list rows
+                    # carry full captions the page never renders, so anchors built
+                    # from them would not overlap a DOM-only (API disabled/failed)
+                    # run and every such run would be refused as ACCOUNT_MISMATCH.
+                    page_records = [
+                        video
+                        for video in structured_videos
+                        if video.get("classification_source") != WORK_LIST_CLASSIFICATION_SOURCE
+                    ]
+                    api_records = [
+                        video
+                        for video in structured_videos
+                        if video.get("classification_source") == WORK_LIST_CLASSIFICATION_SOURCE
+                    ]
+                    if page_records or not api_records:
+                        account_identity = self._verify_browser_account_identity(
+                            account_id, page_records, captured_at
+                        )
+                    else:
+                        # The first screen can be entirely pinned/scheduled cards the
+                        # extractor cannot parse while the API still returned the
+                        # whole list. Platform item ids are a stronger, title-free
+                        # identity: the list must share ids with rows already bound
+                        # to this account, otherwise refuse exactly as before.
+                        account_identity = self._verify_account_by_item_ids(account_id, api_records)
                 else:
                     account_identity = {"status": "not_verified", "bound": False}
                 snapshot_id = self._save_snapshot(account_id, snapshot)
                 job_status = self._job_status_from_login_status(snapshot["login_status"])
                 videos_upserted = 0
                 metric_snapshots = 0
+                dedupe_dropped = 0
                 if snapshot["login_status"] == LOGGED_IN:
                     videos_upserted, metric_snapshots = self._upsert_structured_videos(
                         account_id, structured_videos, job_id, captured_at
                     )
+                    dedupe_dropped = max(0, len(structured_videos) - videos_upserted)
                     declared = load_stats.get("page_total_video_count")
                     loaded = int(load_stats.get("loaded_card_count") or 0)
                     parsed = len(structured_videos)
                     if parsed == 0 and declared != 0:
                         job_status = "partial"
                     elif declared is not None and (loaded < int(declared) or parsed < int(declared)):
+                        job_status = "partial"
+                    elif load_stats.get("api_stop_reason") not in (None, "disabled"):
+                        # work_list paging was attempted but did not reach the end:
+                        # whatever pages arrived were merged, so say so instead of
+                        # letting the truncation hide behind "completed".
                         job_status = "partial"
                 coverage = self._list_coverage(structured_videos)
                 progress = {
@@ -342,6 +374,14 @@ class BrowserService:
                 }
                 self._finish_job(job_id, job_status, progress=progress, coverage=coverage)
                 warnings = self._sync_notes(snapshot["login_status"], job_status)
+                api_stop_reason = load_stats.get("api_stop_reason")
+                if api_stop_reason not in (None, "disabled"):
+                    warnings = [*warnings, f"work_list 翻页未走到底({api_stop_reason})，列表按已取到的页 + 页面首屏合并保存。"]
+                if dedupe_dropped:
+                    # A page card and its work_list twin were not paired by the merge
+                    # and collapsed onto one local row at write time; say so, because
+                    # a systematic pairing failure would otherwise degrade silently.
+                    warnings = [*warnings, f"{dedupe_dropped} 条记录在入库时与同一作品的另一条合并（页面卡片与 work_list 未配对）。"]
                 return {
                     "sync_job_id": job_id,
                     "snapshot_id": snapshot_id,
@@ -356,6 +396,13 @@ class BrowserService:
                     "page_total_video_count": load_stats.get("page_total_video_count"),
                     "loaded_video_count": load_stats.get("loaded_card_count"),
                     "current_dom_card_count": load_stats.get("current_dom_card_count"),
+                    "dom_card_count": load_stats.get("dom_card_count"),
+                    "api_added_count": load_stats.get("api_added_count"),
+                    "api_loaded_count": load_stats.get("api_loaded_count"),
+                    "api_pages": load_stats.get("api_pages"),
+                    "api_total": load_stats.get("api_total"),
+                    "api_stop_reason": api_stop_reason,
+                    "dedupe_dropped": dedupe_dropped,
                     "videos_upserted": videos_upserted,
                     "metrics_upserted": metric_snapshots,
                     "captured_at": captured_at,
@@ -1219,6 +1266,57 @@ class BrowserService:
         )
         return snapshot_id
 
+    def _verify_account_by_item_ids(
+        self, account_id: str, videos: list[dict[str, Any]]
+    ) -> dict[str, Any]:
+        """Title-free identity check used only when the page yielded no parsable card.
+
+        Never touches ``browser_account_bindings``; a later run with page cards
+        refreshes the salted anchors as usual.
+        """
+        binding = self.db.query_one(
+            "SELECT account_id FROM browser_account_bindings WHERE account_id = ?",
+            (account_id,),
+        )
+        item_ids = sorted({str(v.get("platform_item_id")) for v in videos if v.get("platform_item_id")})
+        if not item_ids:
+            raise AppError(
+                ACCOUNT_IDENTITY_UNRESOLVED,
+                "当前页面没有可解析的作品卡片，且列表接口未返回作品 ID，已拒绝确认账号并写入数据。",
+                retryable=True,
+                extra={"next_action": "重新加载作品列表；如确认更换账号，请执行 purge --yes 后重新登录。"},
+            )
+        if binding is None:
+            has_rows = self.db.query_one(
+                "SELECT COUNT(*) AS n FROM videos WHERE account_id = ? AND source = 'browser_dom'",
+                (account_id,),
+            )
+            if has_rows and int(has_rows["n"] or 0) == 0:
+                # Nothing to compare against yet and nothing to protect: the very
+                # first sync of an empty database, same as the DOM path's
+                # "unbound_empty_account" outcome. Binding waits for page cards.
+                return {"status": "unbound_no_page_cards", "bound": False, "anchor_count": 0}
+        placeholders = ",".join("?" for _ in item_ids)
+        overlap = self.db.query_one(
+            f"SELECT COUNT(*) AS n FROM videos WHERE account_id = ? "
+            f"AND (item_id IN ({placeholders}) OR video_id IN ({placeholders}))",
+            (account_id, *item_ids, *item_ids),
+        )
+        overlap_count = int(overlap["n"] or 0) if overlap else 0
+        if overlap_count == 0:
+            raise AppError(
+                ACCOUNT_MISMATCH,
+                "当前登录账号的作品列表与本地已有数据没有任何重合，已拒绝写入。",
+                retryable=False,
+                extra={"next_action": "请切回原账号；如需更换账号，请先执行 purge --yes。"},
+            )
+        return {
+            "status": "verified_by_item_ids",
+            "bound": binding is not None,
+            "anchor_count": 0,
+            "overlap_count": overlap_count,
+        }
+
     def _verify_browser_account_identity(
         self,
         account_id: str,
@@ -1377,6 +1475,11 @@ class BrowserService:
     ) -> tuple[int, int]:
         metric_date = datetime.now(ZoneInfo("Asia/Shanghai")).date().isoformat()
         snapshot_count = 0
+        # Two records resolving to one local row inside a single job (a page card
+        # and its work_list twin that the merge heuristic failed to pair) would
+        # trip UNIQUE(sync_job_id, video_id, source) on the snapshot table and
+        # abort the whole sync. Keep the first, drop the rest — never crash here.
+        seen_local_ids: set[str] = set()
         with self.db.transaction() as conn:
             for video in videos:
                 platform_id = video.get("platform_item_id")
@@ -1394,6 +1497,9 @@ class BrowserService:
                         (account_id, video["publish_time"], video["title"]),
                     ).fetchone()
                 local_id = str(existing[0]) if existing else self._local_video_id(account_id, video)
+                if local_id in seen_local_ids:
+                    continue
+                seen_local_ids.add(local_id)
                 conn.execute(
                     """
                     INSERT INTO videos
@@ -1483,7 +1589,7 @@ class BrowserService:
                 )
                 self._insert_derived_conn(conn, snapshot_id, raw, captured_at)
                 snapshot_count += 1
-        return len(videos), snapshot_count
+        return len(seen_local_ids), snapshot_count
 
     def _save_metric_snapshot(
         self,
@@ -1699,7 +1805,17 @@ class BrowserService:
                 raise AppError(DATA_NOT_AVAILABLE, "Some requested videos are not in the local cache.", False, {"missing_video_ids": missing})
             return rows
         return self.db.query_all(
+            # Rows the list sync knows about but whose detail page cannot exist yet
+            # (scheduled, still in review, rejected) would only burn the batch on
+            # "暂不支持查看详情数据"; keep "recent" meaning recently *published*.
             "SELECT * FROM videos WHERE account_id = ? AND source = 'browser_dom' "
+            "AND is_active = 1 "
+            "AND (publish_time IS NULL OR publish_time <= CAST(strftime('%s', 'now') AS INTEGER)) "
+            "AND COALESCE(status, '') NOT IN ('不适宜公开', '审核中') "
+            # Allow-list by structure too: only cards/items of published (public or
+            # private) posts ever carry a detail link, and without one the detail
+            # sync must fall back to searching the first page by title/time.
+            "AND video_url IS NOT NULL "
             "ORDER BY publish_time DESC, id ASC LIMIT ?",
             (account_id, recent_limit),
         )

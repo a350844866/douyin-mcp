@@ -28,6 +28,8 @@ class Settings:
     douyin_detail_batch_size: int = 10
     douyin_profile_lock_filename: str = ".douyin-mcp.lock"
     douyin_list_parser_version: str = "creator-manage-v2"
+    douyin_list_api_paging: bool = True
+    douyin_list_api_max_pages: int = 8
     douyin_detail_parser_version: str = "creator-detail-v2"
     douyin_creator_home_url: str = "https://creator.douyin.com/"
     douyin_creator_video_url: str = "https://creator.douyin.com/creator-micro/content/manage"
@@ -131,6 +133,10 @@ def load_settings(
         ),
         douyin_list_parser_version=_get(
             merged, "DOUYIN_LIST_PARSER_VERSION", "creator-manage-v2"
+        ),
+        douyin_list_api_paging=_get_bool(merged, "DOUYIN_LIST_API_PAGING", True),
+        douyin_list_api_max_pages=min(
+            20, max(1, _get_int(merged, "DOUYIN_LIST_API_MAX_PAGES", 8))
         ),
         douyin_detail_parser_version=_get(
             merged, "DOUYIN_DETAIL_PARSER_VERSION", "creator-detail-v2"

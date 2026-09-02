@@ -565,11 +565,288 @@ def extract_structured_videos(page: Any) -> list[dict[str, Any]]:
     return records
 
 
+# --- work_list API paging ---------------------------------------------------
+#
+# The content-manage page renders one virtualized grid of 12 cards and never
+# issues another `work_list` request on window scroll (verified 2026-08-31:
+# four scrolls, zero new requests). Its order is pinned → scheduled → published
+# (newest first), so every scheduled post hides one more published post from
+# the DOM extractor. The same endpoint accepts `count` and `max_cursor` without
+# any signature parameter, so the logged-in context can page through the whole
+# list itself. DOM records stay authoritative for the cards they cover; the
+# API only fills what the first page cannot show.
+WORK_LIST_API_TEMPLATE = (
+    "https://creator.douyin.com/janus/douyin/creator/pc/work_list"
+    "?status=0&count={count}&max_cursor={cursor}"
+    "&scene=star_atlas&device_platform=android&aid=1128"
+)
+WORK_LIST_PAGE_COUNT = 30
+WORK_LIST_DETAIL_URL_TEMPLATE = (
+    "https://creator.douyin.com/creator-micro/work-management/work-detail/{aweme_id}"
+)
+WORK_LIST_CLASSIFICATION_SOURCE = "work_list_api_v1"
+_WORK_LIST_STATUS_PUBLIC = 102
+
+
+def paginate_work_list(
+    hit: Any,
+    max_pages: int = 8,
+    page_count: int = WORK_LIST_PAGE_COUNT,
+) -> tuple[list[dict[str, Any]], str | None, int | None]:
+    """Page through `work_list` via the injected `hit(count, cursor) -> body`.
+
+    Returns `(items, stop_reason, declared_total)`. `stop_reason` is `None`
+    only when the server said there is nothing more; every truncated exit is
+    named so callers can tell "reached the end" from "gave up".
+    """
+    items: list[dict[str, Any]] = []
+    declared_total: int | None = None
+    cursor: Any = 0
+    seen_cursors = {"0"}
+    for _ in range(max(1, int(max_pages))):
+        try:
+            body = hit(page_count, cursor)
+        except Exception as exc:  # noqa: BLE001 - the DOM path must survive any API failure
+            return items, f"error:{type(exc).__name__}", declared_total
+        if not isinstance(body, dict):
+            return items, "bad_body", declared_total
+        if body.get("status_code") not in (0, "0", None):
+            return items, f"bad_status:{body.get('status_code')}", declared_total
+        if body.get("total") is not None:
+            try:
+                declared_total = int(body["total"])
+            except (TypeError, ValueError):
+                declared_total = None
+        page_items = [item for item in (body.get("aweme_list") or []) if isinstance(item, dict)]
+        if not page_items:
+            return items, "empty_page", declared_total
+        items.extend(page_items)
+        if not body.get("has_more"):
+            return items, None, declared_total
+        next_cursor = body.get("max_cursor")
+        if not next_cursor:
+            return items, "missing_cursor_with_has_more", declared_total
+        if str(next_cursor) in seen_cursors:
+            return items, "cursor_stalled", declared_total
+        seen_cursors.add(str(next_cursor))
+        cursor = next_cursor
+    return items, "max_pages_exhausted", declared_total
+
+
+def _work_list_status_text(item: dict[str, Any], now_ts: int) -> str | None:
+    """Mirror the status labels the DOM cards expose, so downstream filters match."""
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    if status.get("is_prohibited"):
+        return "不适宜公开"
+    if status.get("in_reviewing"):
+        return "审核中"
+    if status.get("is_private") or status.get("self_see") or status.get("private_status") not in (None, 0, "0"):
+        return "私密"
+    create_time = _work_list_create_time(item)
+    if create_time is not None and create_time > now_ts + 60:
+        # Scheduled posts carry their future publish time; the DOM shows them
+        # without any status label, so keep that shape (visibility=unknown).
+        return None
+    if item.get("status_value") in (_WORK_LIST_STATUS_PUBLIC, str(_WORK_LIST_STATUS_PUBLIC)):
+        return "已发布"
+    return None
+
+
+def _work_list_create_time(item: dict[str, Any]) -> int | None:
+    try:
+        value = int(float(item.get("create_time")))
+    except (TypeError, ValueError):
+        return None
+    if value > 10**11:  # milliseconds guard: the cursor is ms, keep create_time robust too
+        value //= 1000
+    return value if value > 0 else None
+
+
+def normalize_work_list_item(item: dict[str, Any], now_ts: int | None = None) -> dict[str, Any] | None:
+    """Turn one `work_list` item into the same record shape the DOM extractor emits."""
+    if not isinstance(item, dict):
+        return None
+    status = item.get("status") if isinstance(item.get("status"), dict) else {}
+    if status.get("is_delete"):
+        return None
+    aweme_id = str(item.get("aweme_id") or item.get("item_id") or "").strip()
+    create_time = _work_list_create_time(item)
+    title = re.sub(r"\s+", " ", str(item.get("desc") or item.get("caption") or "")).strip()
+    if not aweme_id or create_time is None or not title:
+        return None
+    now_ts = int(now_ts if now_ts is not None else datetime.now(tz=ZoneInfo("Asia/Shanghai")).timestamp())
+    # The DOM shows minute precision; floor so identity/fingerprint stay byte-equal
+    # with cards captured from the page for the same post.
+    floored = create_time - (create_time % 60)
+    publish_text = datetime.fromtimestamp(floored, ZoneInfo("Asia/Shanghai")).strftime("%Y年%m月%d日 %H:%M")
+    status_text = _work_list_status_text(item, now_ts)
+    published_public = status_text == "已发布"
+    metrics: dict[str, Any] = {}
+    if published_public:
+        stats = item.get("statistics") if isinstance(item.get("statistics"), dict) else {}
+        for label, key in (
+            ("播放", "play_count"),
+            ("点赞", "digg_count"),
+            ("评论", "comment_count"),
+            ("分享", "share_count"),
+            ("收藏", "collect_count"),
+        ):
+            if stats.get(key) is not None:
+                metrics[label] = str(stats.get(key))
+    cover_url = None
+    cover = item.get("Cover") if isinstance(item.get("Cover"), dict) else None
+    if cover and isinstance(cover.get("url_list"), list) and cover["url_list"]:
+        cover_url = cover["url_list"][0]
+    raw = {
+        "title": title,
+        "publish_time": publish_text,
+        "status": status_text,
+        "cover_url": cover_url,
+        # Only cards of public posts expose a detail link on the page; keep that
+        # rule so scheduled / prohibited rows never get a URL the detail sync
+        # would try to open.
+        "detail_url": WORK_LIST_DETAIL_URL_TEMPLATE.format(aweme_id=aweme_id)
+        if status_text in ("已发布", "私密")
+        else None,
+        "platform_item_id": aweme_id,
+        "duration": None,
+        "metrics": metrics,
+    }
+    record = normalize_video_record(raw)
+    if record is None:
+        return None
+    record["classification_source"] = WORK_LIST_CLASSIFICATION_SOURCE
+    return record
+
+
+def _work_list_titles_match(dom_title: str, api_title: str) -> bool:
+    """The page truncates long captions with an ellipsis; the API returns them whole."""
+    dom = re.sub(r"\s+", " ", str(dom_title or "")).strip()
+    api = re.sub(r"\s+", " ", str(api_title or "")).strip()
+    if not dom or not api:
+        return False
+    if dom == api:
+        return True
+    stem = dom.rstrip("…").rstrip(".").rstrip()
+    return len(stem) >= 6 and api.startswith(stem)
+
+
+def merge_work_list_records(
+    collected: dict[str, dict[str, Any]],
+    api_records: list[dict[str, Any]],
+) -> int:
+    """Merge API records into the DOM-keyed map in place; return how many were added.
+
+    Page cards stay authoritative. A card without a detail link (scheduled or
+    prohibited posts have none) cannot be keyed by platform id, so it is matched
+    to its API twin by publish minute + title and only *enriched* with the id;
+    emitting both would upsert the same local row twice inside one sync job.
+    """
+    unkeyed_by_time: dict[Any, list[str]] = {}
+    for key, record in collected.items():
+        if not record.get("platform_item_id"):
+            unkeyed_by_time.setdefault(record.get("publish_time"), []).append(key)
+    added = 0
+    for record in api_records:
+        platform_id = str(record.get("platform_item_id") or "")
+        if not platform_id:
+            continue
+        if platform_id in collected:
+            # The page card wins (title / status / link), but its counters are
+            # what the card renders — "5.3万" — while the API carries the exact
+            # integer for the same post; take the exact one when present.
+            _copy_api_counts(collected[platform_id], record)
+            continue
+        twin_key = None
+        for key in unkeyed_by_time.get(record.get("publish_time"), []):
+            if _work_list_titles_match(collected[key].get("title", ""), record.get("title", "")):
+                twin_key = key
+                break
+        if twin_key is not None:
+            twin = collected[twin_key]
+            twin["platform_item_id"] = platform_id
+            if not twin.get("video_url") and record.get("video_url"):
+                twin["video_url"] = record["video_url"]
+            _copy_api_counts(twin, record)
+            twin["source_fingerprint"] = _record_fingerprint(twin)
+            unkeyed_by_time[record.get("publish_time")].remove(twin_key)
+            continue
+        collected[platform_id] = record
+        added += 1
+    return added
+
+
+_COUNT_FIELDS = ("play_count", "like_count", "comment_count", "share_count", "collect_count")
+
+
+def _copy_api_counts(target: dict[str, Any], api_record: dict[str, Any]) -> None:
+    for field in _COUNT_FIELDS:
+        value = api_record.get(field)
+        if value is not None:
+            target[field] = value
+
+
+def _record_fingerprint(record: dict[str, Any]) -> str:
+    """Same formula as normalize_video_record, for records enriched after the fact."""
+    source = "|".join(
+        [
+            str(record.get("platform_item_id") or ""),
+            str(record.get("publish_time")),
+            str(record.get("title") or ""),
+            str(record.get("duration") or ""),
+        ]
+    )
+    return hashlib.sha256(source.encode("utf-8")).hexdigest()
+
+
+def collect_work_list_records(
+    page: Any,
+    max_pages: int = 8,
+    referer: str | None = None,
+    now_ts: int | None = None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fetch every `work_list` page through the page's own request context."""
+    context = getattr(page, "context", None)
+    request_ctx = getattr(context, "request", None) or getattr(page, "request", None)
+    if request_ctx is None:
+        return [], {"api_stop_reason": "no_request_context", "api_pages": 0, "api_loaded_count": 0, "api_total": None}
+    referer = referer or str(getattr(page, "url", "") or "") or None
+    pages_hit = 0
+
+    def hit(count: int, cursor: Any) -> Any:
+        nonlocal pages_hit
+        pages_hit += 1
+        response = request_ctx.get(
+            WORK_LIST_API_TEMPLATE.format(count=count, cursor=cursor),
+            headers={"referer": referer} if referer else None,
+            timeout=20000,
+        )
+        status = getattr(response, "status", 200)
+        if status != 200:
+            raise RuntimeError(f"http_{status}")
+        return response.json()
+
+    items, stop_reason, declared_total = paginate_work_list(hit, max_pages=max_pages)
+    records: list[dict[str, Any]] = []
+    for item in items:
+        record = normalize_work_list_item(item, now_ts)
+        if record is not None:
+            records.append(record)
+    return records, {
+        "api_stop_reason": stop_reason,
+        "api_pages": pages_hit,
+        "api_loaded_count": len(records),
+        "api_total": declared_total,
+    }
+
+
 def collect_all_video_cards(
     page: Any,
     max_scrolls: int = 30,
     stable_rounds: int = 3,
     wait_ms: int = 1000,
+    api_paging: bool = True,
+    api_max_pages: int = 8,
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
     """Collect unique cards during scrolling so virtualized lists cannot discard history."""
     state = page.evaluate(_PAGE_STATE_SCRIPT)
@@ -603,14 +880,48 @@ def collect_all_video_cards(
         if state.get("total_count") is not None:
             total_count = int(state["total_count"])
 
+    dom_count = len(collected)
+    api_stats: dict[str, Any] = {
+        "api_stop_reason": "disabled" if not api_paging else None,
+        "api_pages": 0,
+        "api_loaded_count": 0,
+        "api_total": None,
+    }
+    api_added = 0
+    if api_paging:
+        try:
+            api_records, api_stats = collect_work_list_records(page, max_pages=api_max_pages)
+            # Pages that did arrive are complete, newest-first, and a strict
+            # superset of the first screen — merge them even when paging stopped
+            # early; the stop reason is reported so truncation stays visible.
+            api_added = merge_work_list_records(collected, api_records)
+        except Exception as exc:  # noqa: BLE001 - never let the API stage break the DOM path
+            api_added = 0
+            api_stats = {
+                "api_stop_reason": f"error:{type(exc).__name__}",
+                "api_pages": 0,
+                "api_loaded_count": 0,
+                "api_total": None,
+            }
+        if (
+            total_count is None
+            and api_stats.get("api_stop_reason") is None
+            and api_stats.get("api_total") is not None
+            and len(collected) >= int(api_stats["api_total"])
+        ):
+            total_count = int(api_stats["api_total"])
+
     records = list(collected.values())
     return records, {
         "initial_card_count": initial_dom_count,
         "current_dom_card_count": current_dom_count,
+        "dom_card_count": dom_count,
         "loaded_card_count": len(records),
         "page_total_video_count": total_count,
         "scroll_rounds": scroll_rounds,
         "stop_reason": stop_reason,
+        "api_added_count": api_added,
+        **api_stats,
     }
 
 
